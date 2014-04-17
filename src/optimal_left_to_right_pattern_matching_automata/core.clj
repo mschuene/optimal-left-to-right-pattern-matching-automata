@@ -1,12 +1,9 @@
 (ns optimal-left-to-right-pattern-matching-automata.core
-     (:require [clojure.set :as set]
-               [clojure.walk :as walk]
-               [clojure.zip :as zip]))
+  (:require [clojure.set :as set]
+            [clojure.walk :as walk]
+            [clojure.zip :as zip]))
 
 (def omega '?)
-
-;;positions are keys to an element - like get-in keys for sequentials
-;;can be ordered sequentially - prewalk through expression
 
 (defn matching-item
   "A matching item is a triple r:a*b where ab is a term and r is a rule label.
@@ -30,11 +27,9 @@
     infinity
     (let [[r a b] matching-item]
       (inc (count a)))))
-
 (defn initial-matching-item [label pattern]
   [label '() pattern])
 
-;;matching set - set of matching items with the same prefix
 (defn matching-set? [matching-items]
   (let [[r a b] (first matching-items)]
     (every? #(let [[r2 a2 b2] %] (= r r2)) (rest matching-items))))
@@ -59,19 +54,10 @@
 (defn arity [function-symbol]
   (or (and (sequential? function-symbol) (second function-symbol)) 0))
 
-;;TODO modify the pattern representation so that
-;;1) functions have arities themselfes, so f becomes [f arity] in the representation
-;;2) omegas get a name - so a valid omega is [? a]
-;;3) a substitution map is created during matches which maps the omega's to their
-;;   matched values
-;;4) the set of different function symbols AND variables in the patterns
-
-;;immer noch gültig
 (defn accept [matching-items s]
   (map forward-matching-position
        (filter #(= (matching-symbol %) s) matching-items)))
 
-;;close brauch jetzt auch die arities und das funktions-set
 (defn close [matching-items]
   (let [F (functions matching-items)]
     (set/union matching-items
@@ -85,40 +71,6 @@
 
 (defn delta [matching-items s]
   (close (accept matching-items s)))
-
-(def initial-matching-set
-;;IMPORTANT close over the initial matching set
-  (close [(initial-matching-item 1 '([f 4] a a ? a))
-          (initial-matching-item 2 '([f 4] [g 2] a ? a a b))
-          (initial-matching-item 3 '([f 4] ? b b b))]))
-
-(defn equivalent-matching-items? [matching-item1 matching-item2]
-  (let [[r1 a1 b1] matching-item1 [r2 a2 b2] matching-item2]
-    (and (= r1 r2) (= b1 b2))))
-
-(defn extract-first-by
-  "returns [extracted rest-of-collection] or false"
-  [f coll]
-  (loop [[c & cs] coll rest-coll []]
-    (if c
-      (if (f c)
-        [c (concat rest-coll cs)]
-        (recur cs (conj rest-coll c)))
-      false)))
-
-(defn equivalent-matching-sets? [matching-set1 matching-set2]
-  (loop [[mit & mits] matching-set1 matching-set2 matching-set2]
-    (if mit
-      (if-let [[mit2 mits2] (extract-first-by #(equivalent-matching-items? mit %)
-                                              matching-set2)]
-        (recur mits mits2)
-        false)
-      (empty? matching-set2))))
-
-;;Define the automaton as a DAG.
-;;The states are in a vector and can be accessed by their position
-;;The transistions can also be stored in a hashmap with [statepos symbol]
-;;as keys and the new state as value
 
 ;;quick and dirty functional graph implementation
 (def empty-graph {})
@@ -151,6 +103,28 @@
      g)
     g))
 
+(defn equivalent-matching-items? [matching-item1 matching-item2]
+  (let [[r1 a1 b1] matching-item1 [r2 a2 b2] matching-item2]
+    (and (= r1 r2) (= b1 b2))))
+
+(defn extract-first-by
+  "returns [extracted rest-of-collection] or false"
+  [f coll]
+  (loop [[c & cs] coll rest-coll []]
+    (if c
+      (if (f c)
+        [c (concat rest-coll cs)]
+        (recur cs (conj rest-coll c)))
+      false)))
+
+(defn equivalent-matching-sets? [matching-set1 matching-set2]
+  (loop [[mit & mits] matching-set1 matching-set2 matching-set2]
+    (if mit
+      (if-let [[mit2 mits2] (extract-first-by #(equivalent-matching-items? mit %)
+                                              matching-set2)]
+        (recur mits mits2)
+        false)
+      (empty? matching-set2))))
 
 (defn failure? [state]
   (or (= '() state) (nil? state)))
@@ -199,9 +173,6 @@
       (let [[new-graph new-nodes-to-visit]
             (create-new-states pos nodes-to-visit graph)]
         (recur new-graph new-nodes-to-visit (inc pos))))))
-
-(defn to-patterns [patterns]
-  (map initial-matching-item (map inc (range)) patterns))
 
 (defn consume-next [g current-state symbol]
   (let [next-state (get-next-node g current-state symbol)]
@@ -256,8 +227,6 @@
           (recur (zip/next loc) next-node
                  (concat bindings add-bindings)))))))
 
-
-
 (use 'clojure.test)
 (let [initial-matching-set (close [(initial-matching-item 1 '([? 2] a b))
                                    (initial-matching-item 2 '([? 1] a))
@@ -270,24 +239,6 @@
          (match-expression dag initial-matching-set '(+ a b))))
   (is (= '[([3 (?) ()]) ((+ a b c))]
          (match-expression dag initial-matching-set '(+ a b c)))))
-
-
-
-#_(defn m [expression]
-  (let [loc (zip/seq-zip expression)]
-    (if (zip/branch? loc)
-      (let [loc (zip/next loc)]
-        (case (first loc)
-          'f (let [loc (zip/next loc)]
-               (or (and (zip/branch? loc)
-                        (let [head-loc (zip/next loc)]
-                          (case (first head-loc)
-                            'g (let [loc (zip/next head-loc)] #_(........))
-                            false)))
-                   (case (first loc)
-                     'a #_ (....)
-                     (case #_.......))))
-          :failure)))))
 
 (defn get-in-expression [expression key]
   (loop [loc (zip/seq-zip expression) [k & ks] key]
@@ -374,10 +325,7 @@
                         rule-map))
                    'nil)]))))))
 
-(def rules
-  [[1 '([f 4] a a ? a) [] '?a '{?a [3]}]
-   [2 '([f 4] [g 2] a ? a ? a) '[(= ?a ?b)] '[?a ?b] '{?b [1 2]
-                                                       ?a [3]}]])
+
 
 (defn compile-rules [rules]
   (let [res
@@ -393,10 +341,9 @@
 
 (let [rules
       [[1 '([f 4] a a ? a) [] '?a '{?a [3]}]
-       [2 '([f 4] [g 2] a ? a ? a) '[(= ?a ?b)] '[?a ?b] '{?b [1 2] ?a [3]}]]
+       [2 '([f 4] [g 2] a ? a ? a) '[(= ?a ?b)] '?b '{?b [1 2] ?a [3]}]]
       f (eval (compile-rules rules))]
-  (is (= '[c c] (f '(f (g a c) a c a))))
+  (is (= 'c (f '(f (g a c) a c a))))
   (is (not (f '(f (g a b) a c a))))
   (is (= 'a (f '(f a a a a))))
   (is (not (f '(f a a a b)))))
-

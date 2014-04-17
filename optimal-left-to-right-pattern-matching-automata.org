@@ -1,0 +1,696 @@
+#+TITLE:Optimal left to right pattern matching Automata 
+#+AUTHOR: Maik Schünemann
+#+email: maikschuenemann@gmail.com
+#+STARTUP:showall
+-----
+
+* Introduction
+  This is a clojure implementation of the algorithm from this [[http://link.springer.com/chapter/10.1007%252FBFb0027016][paper]].
+  The problem that this addresses is matching a term against multiple 
+  patterns simultaneously, *without backtracking* scanning the
+  expression only one time from left to right.
+
+  To accomplish this, a directed acyclic graph representing a
+  deterministic automaton is created from the pattern, with
+  transitions labeled by the next symbol read during a left to right
+  scan through the pattern and the currently matching patterns as
+  nodes. The dag is kept minimal, that is there are no two states in
+  the dag that produce the same matching sub-tree.
+
+  I extended the algorithm in the paper to also work when there is a
+  wildcard on a function symbol like in the following pattern: 
+  '(? a b) and also to handle functions with multiple arities.
+  This adds a few extra cases to the interpreter and the compiler, but
+  in the case it isn't needed doesn't slow down the matching process.
+
+  Interpreting it works as expected - scan through the input
+  expression, for each symbol follow the labeled transition if it
+  exists - pick the default route if one exists in case that fails -
+  fail otherwise - repeat until at failure state or the end of the 
+  expression is reached
+
+  The dag can also be compiled to an optimized clojure function
+  resembling the decision tree that the dag represents. Basically, the
+  function consists of a bunch of (case <location-in-expression>
+  <symbol1> <forward-location-and-check-next-input> .... <default>
+  <go-through-default-route-if-possible>) thus eliminating the need to
+  search through the dag at matching time.
+
+** Implementation
+   #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+     (ns optimal-left-to-right-pattern-matching-automata.core
+       (:require [clojure.set :as set]
+                 [clojure.walk :as walk]
+                 [clojure.zip :as zip]))
+   #+end_src
+   We need a (meta-) symbol for a default transition. It will be
+   called omega from now on
+   #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+   (def omega '?)
+   #+end_src
+*** Representing patterns
+    Because we are concerned with scanning expressions from left to
+    right, the matching positions of the patterns can be totally
+    ordered - by how right they appear in the printed representation -
+    and put in a single list. Function symbols are represented as 
+    [<function-symbol> <number-of-arguments>], so that the flat
+    representation retains all information about the original
+    structure of the pattern. For example, the pattern
+    '(f (g a b) a a b) can be represented as '([f 4] [g 2] a b a a b).
+    In this representation, a pattern is just a list of transition
+    labels that the automaton must perform in order to match an expression
+    against the pattern.
+    During the matching, there will always be a current state which is
+    all patterns with the same matching prefix, a current position
+    where the next symbol will be read, and a suffix to be matched for
+    the next symbols read. This is the definition of a matching-item.
+    #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+      (defn matching-item
+        "A matching item is a triple r:a*b where ab is a term and r is a rule label.
+         The label identifies the origin of the term ab and hence, in a term rewriting system, the rewrite rule which has to be applied when ab is matched * is called
+        the matching dot, a the prefix and b the suffix. The first symbol of b is the matching symbol. The position of the matching dot is the matching position"
+        [r a b]
+        [r a b])
+      
+      (defn matching-symbol [matching-item]
+        (let [[r a b] matching-item]
+          (first b)))
+      
+      (def infinity (Double/MAX_VALUE))
+      
+      (defn final? [matching-item]
+        (let [[r a b] matching-item]
+          (empty? b)))
+      
+      (defn matching-position [matching-item]
+        (if (final? matching-item)
+          infinity
+          (let [[r a b] matching-item]
+            (inc (count a)))))
+      (defn initial-matching-item [label pattern]
+        [label '() pattern])
+   #+end_src
+    The current state of the automaton is then a set of matching items
+    which share the same prefix.
+    #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+      (defn matching-set? [matching-items]
+        (let [[r a b] (first matching-items)]
+          (every? #(let [[r2 a2 b2] %] (= r r2)) (rest matching-items))))
+      
+      (defn initial-matching-set? [matching-items]
+        (and (matching-set? matching-items) (= '() (second (first matching-items)))))
+      
+      (defn final-matching-set? [matching-items]
+        (and (matching-set? matching-items) (= '() (nth (first matching-items) 2))))
+      
+   #+end_src
+    
+
+*** The Transition function for the automaton
+    After we know what the states and the transitions of the automaton
+    will be, we can start looking at the definition for the transition
+    function delta. For more explanation, see the paper itself.
+    Basically, from the current state - the current-matching-set - it
+    returns as next node the set of matching items which could be
+    forwarded by the symbol s - that is what the accept function does.
+    It also avoids backtracking by adding more states when there is an
+    ambiguity in the form that one pattern has a default next
+    transition and another has a transition that goes a level deeper
+    with a function symbol. If the function symbol transition would be
+    followed, it could be that it failed and one had to backtrack and
+    go through the omega transition. 
+    Therefore, for each such situation a new pattern is added to the
+    matching set which consists of the omega rule but with the omega
+    replaced by the next function symbol and a number of omegas that
+    match the functions arity.
+    It is also important to do this *closing over* the current
+    matching set at the very beginning to handle the case of a default
+    omega pattern. The paper fails to mention that.
+    #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+      (defn forward-matching-position [matching-item]
+        (let [[r a b] matching-item]
+          [r (concat a [(first b)]) (rest b)]))
+      
+      (defn functions [matching-set]
+        (into #{} (filter #(or (and (symbol? %) (not= omega %))
+                               (and (sequential? %)
+                                    (symbol? (first %))
+                                    (number? (second %))))
+                          (map matching-symbol matching-set))))
+      
+      (defn arity [function-symbol]
+        (or (and (sequential? function-symbol) (second function-symbol)) 0))
+      
+      (defn accept [matching-items s]
+        (map forward-matching-position
+             (filter #(= (matching-symbol %) s) matching-items)))
+      
+      (defn close [matching-items]
+        (let [F (functions matching-items)]
+          (set/union matching-items
+                     (for [matching-item matching-items
+                           function-symbol F
+                           :let [arityf (arity function-symbol)]
+                           :when (and (= omega (matching-symbol matching-item)))]
+                       (let [[r a b] matching-item]
+                         [r a (concat [function-symbol] (repeat arityf omega)
+                                      (rest b))])))))
+      
+      (defn delta [matching-items s]
+        (close (accept matching-items s)))
+    #+end_src  
+*** Creating the DAG
+
+**** Graph implementation
+     Here is a very simple implementation of a functional graph data
+     structure
+     #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+       ;;quick and dirty functional graph implementation
+       (def empty-graph {})
+       
+       (defn add-node [g n]
+         (if (g n)
+           g
+           (assoc g n {:next #{} :prev #{}})))
+       
+       (defn add-edge [g n1 n2 l]
+         (-> g
+             (add-node n1)
+             (add-node n2)
+             (update-in [n1 :next] conj [n2 l])
+             (update-in [n2 :prev] conj [n1 l])))
+       
+       (defn remove-edge [g n1 n2 l]
+         (-> g
+             (add-node n1)
+             (add-node n2)
+             (update-in [n1 :next] disj [n2 l])
+             (update-in [n2 :prev] disj [n1 l])))
+       
+       (defn remove-node [g n]
+         (if-let [{:keys [next prev]} (g n)]
+           ((comp
+             #(dissoc % n)
+             #(reduce (fn [g* [n* l*]] (remove-edge g* n* n l*)) % prev)
+             #(reduce (fn [g* [n* l*]] (remove-edge g* n n* l*)) % next))
+            g)
+           g))
+   #+end_src
+
+**** Recognizing equivalent states
+     To make the created automaton minimal, equivalent states have to
+     be recognized during the construction phase.
+     Two states are equivalent, if for each item in set1 there exists
+     an equivalent item in set2.
+     Two matching items are equivalent, if they have the same rule
+     label and the same suffix.
+     #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+      (defn equivalent-matching-items? [matching-item1 matching-item2]
+        (let [[r1 a1 b1] matching-item1 [r2 a2 b2] matching-item2]
+          (and (= r1 r2) (= b1 b2))))
+      
+      (defn extract-first-by
+        "returns [extracted rest-of-collection] or false"
+        [f coll]
+        (loop [[c & cs] coll rest-coll []]
+          (if c
+            (if (f c)
+              [c (concat rest-coll cs)]
+              (recur cs (conj rest-coll c)))
+            false)))
+      
+      (defn equivalent-matching-sets? [matching-set1 matching-set2]
+        (loop [[mit & mits] matching-set1 matching-set2 matching-set2]
+          (if mit
+            (if-let [[mit2 mits2] (extract-first-by #(equivalent-matching-items? mit %)
+                                                    matching-set2)]
+              (recur mits mits2)
+              false)
+            (empty? matching-set2))))
+      
+     #+end_src
+**** Constructing the DAG
+     For detailed description about this algorithm, see the paper.
+     Basically, we start with the initial-matching-set and create new
+     states for all possible transitions, add the nodes and the edges
+     to the graph, or only the transition if there already exists an
+     equivalent state in the graph.
+     Then sort the newly created states according to
+     their matching position, so that states with only a few already
+     matched items are handled first.
+     The creation ends when the list of states is traversed
+     completely.
+     #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+       (defn failure? [state]
+         (or (= '() state) (nil? state)))
+       
+       (defn get-next-node [g n l]
+         (some #(and (= (second %) l) (first %)) (get-in g [n :next])))
+       
+       (defn search-equivalent-node [graph node]
+         (first (for [[n v] graph
+                      :when (equivalent-matching-sets? node n)]
+                  n)))
+       
+       (defn insert-according-to-matching-position [nodes-to-visit new-matching-set]
+         ;;nodes-to-visit has to be sorted according to matching-position
+         ;;all matching positions in a matching set are the same
+         (let [nmp (matching-position (first new-matching-set))]
+           (loop [[n & ns :as nodes-left] nodes-to-visit new-nodes-to-visit []]
+             (if n
+               (if (<= (matching-position (first n)) nmp)
+                 (recur ns (conj new-nodes-to-visit n))
+                 (vec (concat new-nodes-to-visit [new-matching-set] nodes-left)))
+               (conj nodes-to-visit new-matching-set)))))
+       
+       ;;problem hier? gibt nur ein omega jetzt mehrere
+       (defn create-new-states [pos nodes-to-visit graph]
+         (let [current-state (nth nodes-to-visit pos)
+               F (functions current-state)]
+           (loop [[s & ss] (concat F [omega]) nodes-to-visit nodes-to-visit graph graph]
+             (if s
+               ;;work to do
+               (let [new-matching-set (delta current-state s)]
+                 ;;check if there is already an equivalent matching-set in the graph
+                 (if-let [eq-node (search-equivalent-node graph new-matching-set)]
+                   (recur ss nodes-to-visit (add-edge graph current-state eq-node s))
+                   (recur ss (insert-according-to-matching-position
+                              nodes-to-visit new-matching-set)
+                          (add-edge graph current-state new-matching-set s))))
+               ;;all symbols consumpted, so return the new state
+               [graph nodes-to-visit]))))
+       
+       (defn create-dag [initial-matching-set]
+         (loop [graph empty-graph nodes-to-visit [initial-matching-set] pos 0]
+           (if (= (count nodes-to-visit) pos)
+             ;;all nodes visited, so return graph
+             (remove-node graph '())
+             (let [[new-graph new-nodes-to-visit]
+                   (create-new-states pos nodes-to-visit graph)]
+               (recur new-graph new-nodes-to-visit (inc pos))))))
+     #+end_src
+
+
+
+#  LocalWords:  acyclic arity
+*** Interpreting the DAG
+    With the constucted minimal dag like described in the paper, we
+    can leave it and now implement how to interpret that dag to match
+    an expression against multiple paterns.
+    To do this, we will traverse the expression from left to right
+    using clojure zippers. We recursively check for the next
+    transition, follow it and move the zipper forward accordingly and
+    fail if there is no transition possible. If we go through a
+    wildcard then we add the current value of the zipper location to
+    the bindings ;;TODO may miss some bindings in rules created by close
+    #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+      (defn consume-next [g current-state symbol]
+        (let [next-state (get-next-node g current-state symbol)]
+          (if (failure? next-state)
+            ;;there was no link, so go through omega link
+            [(get-next-node g current-state omega) [symbol]]
+            [next-state []])))
+      
+      (defn consume-next-level-down [g current-state [symbol count]]
+        (let [next-state (get-next-node g current-state [symbol count])]
+          (if (failure? next-state)
+            ;;there was no link, so go through omega link
+            [(get-next-node g current-state [omega count]) [symbol]]
+            [next-state []])))
+      
+      
+      (defn- next-without-down
+        [loc]
+        (if (= :end (loc 1))
+          loc
+          (or
+           (zip/right loc)
+           (loop [p loc]
+             (if (zip/up p)
+               (or (zip/right (zip/up p)) (recur (zip/up p)))
+               [(zip/node p) :end])))))
+      
+      (defn match-expression [g patterns expression]
+        (loop [loc (zip/seq-zip expression) node patterns bindings []]
+          (if (or (failure? node) (zip/end? loc))
+            ;;done
+            [node bindings]
+            (if (zip/branch? loc)
+              ;;ok try if head symbol matches
+              ;;we are using preorder throughout matching
+              (let [children-count (dec (count (zip/children loc)))
+                    head-loc (zip/next loc)
+                    [next-node add-bindings]
+                    (consume-next-level-down g node [(first head-loc) children-count])]
+                (if (failure? next-node)
+                  ;;head got no match so we have to stay at the original level and try
+                  ;;to match there for a value or omega
+                  (let [[next-node add-bindings] (consume-next g node (first loc))]   
+                    (recur (next-without-down loc) next-node
+                           (concat bindings add-bindings)))
+                  ;;head location got a match so we go on on this level
+                  (recur (zip/next head-loc) next-node
+                         (concat bindings add-bindings))))
+              ;;we have no possibility to go down a level deeper so we can just
+              ;;consume directly
+              (let [[next-node add-bindings] (consume-next g node (first loc))]
+                (recur (zip/next loc) next-node
+                       (concat bindings add-bindings)))))))
+      
+    #+end_src
+**** Testing
+     Here are a few sample calls and tests:
+     #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+       (use 'clojure.test)
+       (let [initial-matching-set (close [(initial-matching-item 1 '([? 2] a b))
+                                          (initial-matching-item 2 '([? 1] a))
+                                          (initial-matching-item 3 '(?))])
+             dag (create-dag initial-matching-set)]
+         (is (= '[([3 (?) ()]) (1)] (match-expression dag initial-matching-set 1)))
+         (is (= '[([3 ([? 1] a) ()] [2 ([? 1] a) ()]) (+)]
+                (match-expression dag initial-matching-set '(+ a))))
+         (is (= '[([3 ([? 2] a b) ()] [1 ([? 2] a b) ()]) (+)]
+                (match-expression dag initial-matching-set '(+ a b))))
+         (is (= '[([3 (?) ()]) ((+ a b c))]
+                (match-expression dag initial-matching-set '(+ a b c)))))
+     #+end_src
+*** Compiling the DAG to a fast clojure function
+    The expression matching can be taken a level further, to the point
+    that the dag can be compiled to a fast clojure function. The
+    resulting clojure function will look like this:
+    #+BEGIN_SRC clojure :tangle no
+      (fn [expression]
+             (let [loc (zip/seq-zip expression)]
+               ;;now code for the single transitions
+               (or 
+                 ;;if there are possible transitions in the dag that lead one
+                 ;;level down - if now the next part is replaced by false
+                 ;;and the next branch of the or is taken
+                 (and (zip/branch? ~'loc) ;;fail if we are not in a branch
+                    (let [head-loc (zip/next loc)]
+                      (case (first head-loc) ;;fast dispatch on the function symbol
+                        <function-symbol> (and (check-if-argument-count-matches)
+                                               <code-for-the-next-transitions>)
+                        #_ (...)
+                        ;;default case
+                        <code-for-wildcard-transition or nil if no wildcard>)))
+                 ;;if there is no matching transition for the current head symbol
+                 ;;try matching the whole current subtree
+                 (case (first loc)
+                   <variable-or-constant> <code-for-next-transition>
+                   #_ (...)
+                   <code-for-wildcard-transition or nil if there is no wildcard>))))
+    #+END_SRC
+    In the end-nodes of the decision tree the code returns either nil
+    for a failure node or sorts the applicable rules by priority
+    (currently only their label but one could introduce the rule that more
+    specific rules come first) and for each defines the bindings,
+    checks the conditions and returns their result.
+
+    Therefor, we now extend the notion of a pattern to the notion of a
+    rule. Currently this is really low level and the rule engine on
+    top if this should take a more human readable form.
+
+    A rule has the form 
+    [<label> <pattern> <conditions> <results> <wildcard-positions>]
+    label and pattern are the same as before, conditions is just a
+    list of expressions to evaluate after succesful match, result is
+    the rhs of the rule and wildcard-positions maps the wildcards in
+    the pattern to the positions in the expression.
+
+    With this the compile-rules function can be defined
+    #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+      (defn get-in-expression [expression key]
+        (loop [loc (zip/seq-zip expression) [k & ks] key]
+          (if k
+            (let [new-loc (loop [k k loc (zip/down loc)]
+                            (if (> k 0)
+                              (recur (dec k) (zip/right loc))
+                              loc))]
+              (recur new-loc ks))
+            (first loc))))
+      
+      (defn compile-step [g current-state rule-map]
+        (let [possible-moves (doall (map last (:next (get g current-state))))
+              head-moves (doall (filter sequential? possible-moves))
+              current-level-moves (doall (remove sequential? possible-moves))]
+          (if (empty? possible-moves) 
+            `(and (zip/end? ~'loc)
+                  ;;current-state was successfully matched. Now get the results for the
+                  ;;matched rules in current-stater
+                  (or
+                   ~@(for [[label & rest] (sort-by first (filter final? current-state))
+                           :let [[conditions result omga-positions]
+                                 (get rule-map label)]]
+                       `(let [~@(for [[name pos] omga-positions
+                                      entry
+                                      [name `(get-in-expression ~'expression ~pos)]]
+                                  entry)]
+                          (and ~@(concat conditions [result]))))))
+            `(or ~(if (empty? head-moves)
+                    'false
+                    ;;have to test going a level deeper
+                    `(and (zip/branch? ~'loc)
+                          (let [~'head-loc (zip/next ~'loc)]
+                            (case (first ~'head-loc)
+                              ;;now all next steps have to be written down in a
+                              ;;case - the right hand side will be a recursive
+                              ;;call to create the code at the next level
+                              ;;the default of case is either nil or the level
+                              ;;from following a [? <number>] label in the graph
+                              ~@(concat
+                                 (for [[s c] head-moves :when (not= omega s)
+                                       entry
+                                       [s `(and
+                                            (= (dec (count (zip/children ~'loc))) ~c)
+                                            (let [~'loc (zip/next ~'head-loc)]
+                                              ~(compile-step
+                                                g
+                                                (get-next-node
+                                                 g current-state [s c])
+                                                rule-map)))]]
+                                   entry)
+                                 [(let [omega-downs (filter #(= (first %) omega)
+                                                            head-moves)]
+                                    `(case (dec (count (zip/children ~'loc)))
+                                       ~@(concat
+                                          (for [[omga c] omega-downs
+                                                entry
+                                                [c
+                                                 `(let [~'loc (zip/next ~'head-loc)]
+                                                    ~(compile-step
+                                                      g
+                                                      (get-next-node
+                                                       g current-state[omega c])
+                                                      rule-map))]]
+                                            entry)
+                                          ;;no further defaulting possible - fail
+                                          '(nil))))])))))
+                 (case (first ~'loc)
+                   ~@(concat
+                      (for [symbol current-level-moves :when (not= omega symbol)
+                            entry
+                            [symbol `(let [~'loc (next-without-down ~'loc)]
+                                       ~(compile-step
+                                         g
+                                         (get-next-node g current-state symbol)
+                                         rule-map))]]
+                        entry)
+                      [(if (some #{omega} current-level-moves)
+                         ;;we have a default case to fall back to
+                         `(let [~'loc (next-without-down ~'loc)]
+                            ~(compile-step
+                              g
+                              (get-next-node g current-state omega)
+                              rule-map))
+                         'nil)]))))))
+      
+      
+      
+      (defn compile-rules [rules]
+        (let [res
+              (for [[label pattern conditions result omga-positions] rules]
+                [(initial-matching-item label pattern) [label [conditions result
+                                                               omga-positions]]])
+              initial-matching-set (close (map first res))
+              rule-map (into {} (map second res))
+              dag (create-dag initial-matching-set)]
+          `(fn [~'expression]
+             (let [~'loc (zip/seq-zip ~'expression)]
+               ~(compile-step dag initial-matching-set rule-map)))))
+   #+end_src
+    
+**** Tests with example rules
+     Here are two example rules:
+     (f a a ?a a) => ?a
+     (f (g a ?b) a ?b a) => ?b
+     Encoded in the current low-level representation they become
+     #+BEGIN_SRC clojure :tangle no
+       [[1 '([f 4] a a ? a) [] '?a '{?a [3]}]
+         [2 '([f 4] [g 2] a ? a ? a) '[(= ?a ?b)] '?b '{?b [1 2] ?a [3]}]]
+     #+END_SRC
+    Here are the corresponding tests:
+    #+begin_src clojure :exports both  :tangle "src/optimal_left_to_right_pattern_matching_automata/core.clj"
+      (let [rules
+            [[1 '([f 4] a a ? a) [] '?a '{?a [3]}]
+             [2 '([f 4] [g 2] a ? a ? a) '[(= ?a ?b)] '?b '{?b [1 2] ?a [3]}]]
+            f (eval (compile-rules rules))]
+        (is (= 'c (f '(f (g a c) a c a))))
+        (is (not (f '(f (g a b) a c a))))
+        (is (= 'a (f '(f a a a a))))
+        (is (not (f '(f a a a b)))))
+   #+end_src
+
+**** Example code
+     The compiled code for the two rules above looks like this:
+     #+begin_src clojure :exports both  :tangle no
+       (clojure.core/fn
+        [expression]
+        (clojure.core/let
+         [loc (clojure.zip/seq-zip expression)]
+         (clojure.core/or
+          (clojure.core/and
+           (clojure.zip/branch? loc)
+           (clojure.core/let
+            [head-loc (clojure.zip/next loc)]
+            (clojure.core/case
+             (clojure.core/first head-loc)
+             f
+             (clojure.core/and
+              (clojure.core/=
+               (clojure.core/dec
+                (clojure.core/count (clojure.zip/children loc)))
+               4)
+              (clojure.core/let
+               [loc (clojure.zip/next head-loc)]
+               (clojure.core/or
+                (clojure.core/and
+                 (clojure.zip/branch? loc)
+                 (clojure.core/let
+                  [head-loc (clojure.zip/next loc)]
+                  (clojure.core/case
+                   (clojure.core/first head-loc)
+                   g
+                   (clojure.core/and
+                    (clojure.core/=
+                     (clojure.core/dec
+                      (clojure.core/count (clojure.zip/children loc)))
+                     2)
+                    (clojure.core/let
+                     [loc (clojure.zip/next head-loc)]
+                     (clojure.core/or
+                      false
+                      (clojure.core/case
+                       (clojure.core/first loc)
+                       a
+                       (clojure.core/let
+                        [loc
+                         (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                          loc)]
+                        (clojure.core/or
+                         false
+                         (clojure.core/case
+                          (clojure.core/first loc)
+                          (clojure.core/let
+                           [loc
+                            (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                             loc)]
+                           (clojure.core/or
+                            false
+                            (clojure.core/case
+                             (clojure.core/first loc)
+                             a
+                             (clojure.core/let
+                              [loc
+                               (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                                loc)]
+                              (clojure.core/or
+                               false
+                               (clojure.core/case
+                                (clojure.core/first loc)
+                                (clojure.core/let
+                                 [loc
+                                  (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                                   loc)]
+                                 (clojure.core/or
+                                  false
+                                  (clojure.core/case
+                                   (clojure.core/first loc)
+                                   a
+                                   (clojure.core/let
+                                    [loc
+                                     (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                                      loc)]
+                                    (clojure.core/and
+                                     (clojure.zip/end? loc)
+                                     (clojure.core/or
+                                      (clojure.core/let
+                                       [?b
+                                        (optimal-left-to-right-pattern-matching-automata.core/get-in-expression
+                                         expression
+                                         [1 2])
+                                        ?a
+                                        (optimal-left-to-right-pattern-matching-automata.core/get-in-expression
+                                         expression
+                                         [3])]
+                                       (clojure.core/and
+                                        (= ?a ?b)
+                                        [?a ?b])))))
+                                   nil))))))
+                             nil))))))
+                       nil))))
+                   (clojure.core/case
+                    (clojure.core/dec
+                     (clojure.core/count (clojure.zip/children loc)))
+                    nil))))
+                (clojure.core/case
+                 (clojure.core/first loc)
+                 a
+                 (clojure.core/let
+                  [loc
+                   (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                    loc)]
+                  (clojure.core/or
+                   false
+                   (clojure.core/case
+                    (clojure.core/first loc)
+                    a
+                    (clojure.core/let
+                     [loc
+                      (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                       loc)]
+                     (clojure.core/or
+                      false
+                      (clojure.core/case
+                       (clojure.core/first loc)
+                       (clojure.core/let
+                        [loc
+                         (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                          loc)]
+                        (clojure.core/or
+                         false
+                         (clojure.core/case
+                          (clojure.core/first loc)
+                          a
+                          (clojure.core/let
+                           [loc
+                            (optimal-left-to-right-pattern-matching-automata.core/next-without-down
+                             loc)]
+                           (clojure.core/and
+                            (clojure.zip/end? loc)
+                            (clojure.core/or
+                             (clojure.core/let
+                              [?a
+                               (optimal-left-to-right-pattern-matching-automata.core/get-in-expression
+                                expression
+                                [3])]
+                              (clojure.core/and ?a)))))
+                          nil))))))
+                    nil)))
+                 nil))))
+             (clojure.core/case
+              (clojure.core/dec
+               (clojure.core/count (clojure.zip/children loc)))
+              nil))))
+          (clojure.core/case (clojure.core/first loc) nil))))   
+     #+end_src
